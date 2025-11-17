@@ -1,6 +1,5 @@
 import streamlit as st
-
-import streamlit as st
+import json
 import pandas as pd
 
 # -------------------------------------------------------------------
@@ -8,6 +7,8 @@ import pandas as pd
 # -------------------------------------------------------------------
 
 DATA_PATH = "data/сводный_словарь.csv"
+CORPUS_PATH = "data/annotations_with_metadata_cleaned.jsonl"
+
 
 st.set_page_config(
     page_title="rEmoRSe Lexicon Explorer",
@@ -70,7 +71,53 @@ def load_lexicon(path_or_url: str) -> pd.DataFrame:
 
 df = load_lexicon(DATA_PATH)
 
+@st.cache_data(show_spinner=True)
+def load_corpus(path: str) -> pd.DataFrame:
+    records = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            obj = json.loads(line)
 
+            meta = obj.get("metadata", {}) or {}
+            ann = obj.get("annotations", {}) or {}
+            token_ann = ann.get("token_level", {}) or {}
+            para_ann = ann.get("paragraph_level", {}) or {}
+            volume = para_ann.get("volume", {}) or {}
+            labels = token_ann.get("labels", []) or []
+
+            # collect unique token-level label types for this paragraph
+            label_set = sorted(
+                {lab for item in labels for lab in item.get("labels", [])}
+            )
+
+            records.append(
+                {
+                    "story_id": obj.get("story_id"),
+                    "part": obj.get("part"),
+                    "text": obj.get("text"),
+                    "lemmatized_text": obj.get("lemmatized_text"),
+                    "title": meta.get("title"),
+                    "author": meta.get("author"),
+                    "year": meta.get("year"),
+                    "sound_type": para_ann.get("sound_type"),
+                    "volume_human": volume.get("human"),
+                    "volume_nature": volume.get("nature"),
+                    "volume_artificial": volume.get("artificial"),
+                    "token_labels": "; ".join(label_set),
+                    "n_token_annotations": len(labels),
+                }
+            )
+
+    df_corpus = pd.DataFrame(records)
+
+    # Some convenience helpers
+    df_corpus["year"] = pd.to_numeric(df_corpus["year"], errors="coerce")
+    df_corpus["author"] = df_corpus["author"].fillna("Unknown")
+
+    return df_corpus
+
+
+corpus_df = load_corpus(CORPUS_PATH)
 # -------------------------------------------------------------------
 # SIDEBAR CONTROLS
 # -------------------------------------------------------------------
@@ -125,9 +172,15 @@ built from:
 """
 )
 
-tab_explorer, tab_stats, tab_coverage = st.tabs(
-    ["🔍 Lexicon explorer", "📊 Emotion statistics", "🌐 Cross-lexicon coverage"]
+tab_explorer, tab_stats, tab_coverage, tab_corpus = st.tabs(
+    [
+        "🔍 Lexicon explorer",
+        "📊 Emotion statistics",
+        "🌐 Cross-lexicon coverage",
+        "📚 Corpus search",
+    ]
 )
+
 
 
 # -------------------------------------------------------------------
@@ -349,4 +402,172 @@ with tab_coverage:
         "Counts here are per lemma (not per lemma–emotion pair). "
         "This gives a rough overview of how rEmoRSe intersects with other resources."
     )
+# -------------------------------------------------------------------
+# TAB 4: CORPUS SEARCH
+# -------------------------------------------------------------------
+
+with tab_corpus:
+    st.subheader("Corpus search (annotated short stories)")
+
+    st.markdown(
+        """
+Search the annotated corpus by text or lemma.  
+You can filter by author and year, and view short snippets with your query highlighted.
+"""
+    )
+
+    # --- Controls ---
+
+    # Query
+    query = st.text_input("Search query", value="")
+
+    # Where to search
+    search_in = st.radio(
+        "Search within",
+        ["Original text", "Lemmatized text", "Both"],
+        horizontal=True,
+    )
+
+    # Author filter
+    authors_sorted = sorted(corpus_df["author"].dropna().unique())
+    selected_authors = st.multiselect(
+        "Filter by author (optional)",
+        options=authors_sorted,
+        default=[],
+    )
+
+    # Year range filter
+    min_year = int(corpus_df["year"].min())
+    max_year = int(corpus_df["year"].max())
+    year_min, year_max = st.slider(
+        "Year range",
+        min_value=min_year,
+        max_value=max_year,
+        value=(min_year, max_year),
+        step=1,
+    )
+
+    # Token labels filter (optional)
+    all_token_labels = sorted(
+        {
+            lab.strip()
+            for labs in corpus_df["token_labels"].dropna().unique()
+            for lab in labs.split(";")
+            if lab.strip()
+        }
+    )
+    selected_labels = st.multiselect(
+        "Filter by token-level labels (optional)",
+        options=all_token_labels,
+        default=[],
+        help="Example labels: cat_voice, cat_human, marker_quality, ...",
+    )
+
+    # Max results
+    max_results = st.number_input(
+        "Max results to display",
+        min_value=10,
+        max_value=500,
+        value=100,
+        step=10,
+    )
+
+    # --- Apply filters ---
+
+    results = corpus_df.copy()
+
+    # Author filter
+    if selected_authors:
+        results = results[results["author"].isin(selected_authors)]
+
+    # Year filter
+    results = results[results["year"].between(year_min, year_max)]
+
+    # Token labels filter: require all selected labels to be present
+    if selected_labels:
+        def has_all_labels(row_labels: str) -> bool:
+            if not row_labels:
+                return False
+            row_set = {x.strip() for x in row_labels.split(";")}
+            return all(lbl in row_set for lbl in selected_labels)
+
+        results = results[results["token_labels"].apply(has_all_labels)]
+
+    # Query filter
+    if query.strip():
+        q = query.lower()
+
+        if search_in == "Original text":
+            mask = results["text"].str.lower().str.contains(q, na=False)
+        elif search_in == "Lemmatized text":
+            mask = results["lemmatized_text"].str.lower().str.contains(q, na=False)
+        else:  # Both
+            mask = (
+                results["text"].str.lower().str.contains(q, na=False)
+                | results["lemmatized_text"].str.lower().str.contains(q, na=False)
+            )
+
+        results = results[mask]
+
+    n_matches = len(results)
+    st.markdown(f"**Matches found:** {n_matches}")
+
+    # --- Helper: build a highlighted snippet ---
+
+    import re
+
+    def make_snippet(text: str, query: str, window: int = 80) -> str:
+        if not query.strip():
+            # just shorten long paragraphs
+            if len(text) > 2 * window:
+                return text[: 2 * window] + " ..."
+            return text
+
+        pattern = re.compile(re.escape(query), flags=re.IGNORECASE)
+        match = pattern.search(text)
+        if not match:
+            if len(text) > 2 * window:
+                return text[: 2 * window] + " ..."
+            return text
+
+        start = max(0, match.start() - window)
+        end = min(len(text), match.end() + window)
+        snippet = text[start:end]
+
+        # highlight all occurrences in the snippet via markdown bold
+        snippet = pattern.sub(lambda m: f"**{m.group(0)}**", snippet)
+
+        if start > 0:
+            snippet = "… " + snippet
+        if end < len(text):
+            snippet = snippet + " …"
+
+        return snippet
+
+    # --- Show results ---
+
+    if n_matches == 0:
+        st.info("No passages match the current query and filters.")
+    else:
+        # order results by year and story/part
+        results = results.sort_values(["year", "author", "story_id", "part"]).head(
+            int(max_results)
+        )
+
+        st.markdown("### Results")
+
+        for _, row in results.iterrows():
+            header = f"**{row['title']}** — {row['author']} ({int(row['year'])})"
+            subheader = f"Story ID: `{row['story_id']}`, paragraph: {row['part']} · sound_type: `{row['sound_type']}`"
+
+            st.markdown(header)
+            st.caption(subheader)
+
+            snippet = make_snippet(row["text"], query)
+            st.markdown(snippet)
+
+            if row["token_labels"]:
+                st.caption(f"Token labels: {row['token_labels']}")
+
+            st.markdown("---")
 
