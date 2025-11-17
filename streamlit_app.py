@@ -7,7 +7,8 @@ import pandas as pd
 # -------------------------------------------------------------------
 
 DATA_PATH = "data/сводный_словарь.csv"
-CORPUS_PATH = "data/annotations_with_metadata_cleaned.jsonl"
+AFFECT_PATH = "data/affect_joined_merged.csv"
+META_PATH = "data/story_meta.csv"
 
 
 st.set_page_config(
@@ -71,53 +72,32 @@ def load_lexicon(path_or_url: str) -> pd.DataFrame:
 
 df = load_lexicon(DATA_PATH)
 
+
+
+
 @st.cache_data(show_spinner=True)
-def load_corpus(path: str) -> pd.DataFrame:
-    records = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            obj = json.loads(line)
+def load_affect_and_meta(affect_path: str, meta_path: str) -> pd.DataFrame:
+    affect = pd.read_csv(affect_path)
+    meta = pd.read_csv(meta_path)
 
-            meta = obj.get("metadata", {}) or {}
-            ann = obj.get("annotations", {}) or {}
-            token_ann = ann.get("token_level", {}) or {}
-            para_ann = ann.get("paragraph_level", {}) or {}
-            volume = para_ann.get("volume", {}) or {}
-            labels = token_ann.get("labels", []) or []
+    df = affect.merge(meta, on="StoryID", how="left")
 
-            # collect unique token-level label types for this paragraph
-            label_set = sorted(
-                {lab for item in labels for lab in item.get("labels", [])}
-            )
+    # Same as before: numeric V/A, mean, etc.
+    for col in ["valence_1", "arousal_1", "valence_2", "arousal_2"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-            records.append(
-                {
-                    "story_id": obj.get("story_id"),
-                    "part": obj.get("part"),
-                    "text": obj.get("text"),
-                    "lemmatized_text": obj.get("lemmatized_text"),
-                    "title": meta.get("title"),
-                    "author": meta.get("author"),
-                    "year": meta.get("year"),
-                    "sound_type": para_ann.get("sound_type"),
-                    "volume_human": volume.get("human"),
-                    "volume_nature": volume.get("nature"),
-                    "volume_artificial": volume.get("artificial"),
-                    "token_labels": "; ".join(label_set),
-                    "n_token_annotations": len(labels),
-                }
-            )
+    df["valence_mean"] = df[["valence_1", "valence_2"]].mean(axis=1, skipna=True)
+    df["arousal_mean"] = df[["arousal_1", "arousal_2"]].mean(axis=1, skipna=True)
 
-    df_corpus = pd.DataFrame(records)
+    df["AUTHOR"] = df["AUTHOR"].fillna("Unknown")
+    df["TITLE"] = df["TITLE"].fillna("Unknown title")
 
-    # Some convenience helpers
-    df_corpus["year"] = pd.to_numeric(df_corpus["year"], errors="coerce")
-    df_corpus["author"] = df_corpus["author"].fillna("Unknown")
-
-    return df_corpus
+    return df
 
 
-corpus_df = load_corpus(CORPUS_PATH)
+affect_df = load_affect_and_meta(AFFECT_PATH, META_PATH)
+
 # -------------------------------------------------------------------
 # SIDEBAR CONTROLS
 # -------------------------------------------------------------------
@@ -177,9 +157,10 @@ tab_explorer, tab_stats, tab_coverage, tab_corpus = st.tabs(
         "🔍 Lexicon explorer",
         "📊 Emotion statistics",
         "🌐 Cross-lexicon coverage",
-        "📚 Corpus search",
+        "📚 Corpus (VAD) search",
     ]
 )
+
 
 
 
@@ -403,33 +384,30 @@ with tab_coverage:
         "This gives a rough overview of how rEmoRSe intersects with other resources."
     )
 # -------------------------------------------------------------------
-# TAB 4: CORPUS SEARCH
+# TAB 4: CORPUS (VAD) SEARCH
 # -------------------------------------------------------------------
 
 with tab_corpus:
-    st.subheader("Corpus search (annotated short stories)")
+    st.subheader("Corpus search (paragraph-level valence & arousal)")
 
     st.markdown(
         """
-Search the annotated corpus by text or lemma.  
-You can filter by author and year, and view short snippets with your query highlighted.
+Search the **annotated short-story corpus** at the **paragraph level**.  
+Each paragraph has two annotators' ratings on valence (−3…3) and arousal (1…5).
 """
     )
 
     # --- Controls ---
 
-    # Query
-    query = st.text_input("Search query", value="")
-
-    # Where to search
-    search_in = st.radio(
-        "Search within",
-        ["Original text", "Lemmatized text", "Both"],
-        horizontal=True,
+    # Text query
+    query = st.text_input(
+        "Search in paragraph text (optional, case-insensitive)",
+        value="",
+        placeholder="например: счастье, страх, война…",
     )
 
     # Author filter
-    authors_sorted = sorted(corpus_df["author"].dropna().unique())
+    authors_sorted = sorted(affect_df["AUTHOR"].dropna().unique())
     selected_authors = st.multiselect(
         "Filter by author (optional)",
         options=authors_sorted,
@@ -437,35 +415,41 @@ You can filter by author and year, and view short snippets with your query highl
     )
 
     # Year range filter
-    min_year = int(corpus_df["year"].min())
-    max_year = int(corpus_df["year"].max())
+    year_min_global = int(affect_df["YEAR"].min())
+    year_max_global = int(affect_df["YEAR"].max())
     year_min, year_max = st.slider(
         "Year range",
-        min_value=min_year,
-        max_value=max_year,
-        value=(min_year, max_year),
+        min_value=year_min_global,
+        max_value=year_max_global,
+        value=(year_min_global, year_max_global),
         step=1,
     )
 
-    # Token labels filter (optional)
-    all_token_labels = sorted(
-        {
-            lab.strip()
-            for labs in corpus_df["token_labels"].dropna().unique()
-            for lab in labs.split(";")
-            if lab.strip()
-        }
+    # Valence filter (mean across annotators)
+    val_min_global = float(affect_df["valence_mean"].min())
+    val_max_global = float(affect_df["valence_mean"].max())
+    val_min, val_max = st.slider(
+        "Mean valence range (−3 = very negative, 3 = very positive)",
+        min_value=float(-3.0),
+        max_value=float(3.0),
+        value=(max(val_min_global, -3.0), min(val_max_global, 3.0)),
+        step=0.5,
     )
-    selected_labels = st.multiselect(
-        "Filter by token-level labels (optional)",
-        options=all_token_labels,
-        default=[],
-        help="Example labels: cat_voice, cat_human, marker_quality, ...",
+
+    # Arousal filter (mean across annotators)
+    aro_min_global = float(affect_df["arousal_mean"].min())
+    aro_max_global = float(affect_df["arousal_mean"].max())
+    aro_min, aro_max = st.slider(
+        "Mean arousal range (1 = calm, 5 = very intense)",
+        min_value=float(1.0),
+        max_value=float(5.0),
+        value=(max(aro_min_global, 1.0), min(aro_max_global, 5.0)),
+        step=0.5,
     )
 
     # Max results
     max_results = st.number_input(
-        "Max results to display",
+        "Max paragraphs to display",
         min_value=10,
         max_value=500,
         value=100,
@@ -474,67 +458,48 @@ You can filter by author and year, and view short snippets with your query highl
 
     # --- Apply filters ---
 
-    results = corpus_df.copy()
+    results = affect_df.copy()
 
     # Author filter
     if selected_authors:
-        results = results[results["author"].isin(selected_authors)]
+        results = results[results["AUTHOR"].isin(selected_authors)]
 
     # Year filter
-    results = results[results["year"].between(year_min, year_max)]
+    results = results[results["YEAR"].between(year_min, year_max)]
 
-    # Token labels filter: require all selected labels to be present
-    if selected_labels:
-        def has_all_labels(row_labels: str) -> bool:
-            if not row_labels:
-                return False
-            row_set = {x.strip() for x in row_labels.split(";")}
-            return all(lbl in row_set for lbl in selected_labels)
+    # Valence / arousal filters
+    results = results[
+        results["valence_mean"].between(val_min, val_max)
+        & results["arousal_mean"].between(aro_min, aro_max)
+    ]
 
-        results = results[results["token_labels"].apply(has_all_labels)]
-
-    # Query filter
+    # Text query
     if query.strip():
         q = query.lower()
-
-        if search_in == "Original text":
-            mask = results["text"].str.lower().str.contains(q, na=False)
-        elif search_in == "Lemmatized text":
-            mask = results["lemmatized_text"].str.lower().str.contains(q, na=False)
-        else:  # Both
-            mask = (
-                results["text"].str.lower().str.contains(q, na=False)
-                | results["lemmatized_text"].str.lower().str.contains(q, na=False)
-            )
-
-        results = results[mask]
+        results = results[results["text"].str.lower().str.contains(q, na=False)]
 
     n_matches = len(results)
-    st.markdown(f"**Matches found:** {n_matches}")
+    st.markdown(f"**Paragraphs matching filters:** {n_matches}")
 
-    # --- Helper: build a highlighted snippet ---
+    # --- Helper: make highlighted snippet ---
 
     import re
 
     def make_snippet(text: str, query: str, window: int = 80) -> str:
         if not query.strip():
-            # just shorten long paragraphs
-            if len(text) > 2 * window:
-                return text[: 2 * window] + " ..."
-            return text
+            # just shorten long paragraphs a bit
+            return text if len(text) <= 2 * window else text[: 2 * window] + " …"
 
         pattern = re.compile(re.escape(query), flags=re.IGNORECASE)
         match = pattern.search(text)
         if not match:
-            if len(text) > 2 * window:
-                return text[: 2 * window] + " ..."
-            return text
+            return text if len(text) <= 2 * window else text[: 2 * window] + " …"
 
         start = max(0, match.start() - window)
         end = min(len(text), match.end() + window)
         snippet = text[start:end]
 
-        # highlight all occurrences in the snippet via markdown bold
+        # highlight all occurrences in the snippet
         snippet = pattern.sub(lambda m: f"**{m.group(0)}**", snippet)
 
         if start > 0:
@@ -547,27 +512,43 @@ You can filter by author and year, and view short snippets with your query highl
     # --- Show results ---
 
     if n_matches == 0:
-        st.info("No passages match the current query and filters.")
+        st.info("No paragraphs match the current filters.")
     else:
-        # order results by year and story/part
-        results = results.sort_values(["year", "author", "story_id", "part"]).head(
-            int(max_results)
-        )
+        # sort by year, then story, then part, and limit
+        results = results.sort_values(
+            ["YEAR", "AUTHOR", "StoryID", "part"]
+        ).head(int(max_results))
 
-        st.markdown("### Results")
+        st.markdown("### Matching paragraphs")
 
         for _, row in results.iterrows():
-            header = f"**{row['title']}** — {row['author']} ({int(row['year'])})"
-            subheader = f"Story ID: `{row['story_id']}`, paragraph: {row['part']} · sound_type: `{row['sound_type']}`"
+            # Header with story info
+            header = f"**{row['TITLE']}** — {row['AUTHOR']} ({int(row['YEAR'])})"
+            subheader = (
+                f"Story ID: `{row['StoryID']}`, paragraph: {row['part']} · "
+                f"mean valence: {row['valence_mean']:.1f}, "
+                f"mean arousal: {row['arousal_mean']:.1f}"
+            )
 
             st.markdown(header)
             st.caption(subheader)
 
+            # Show both annotators’ ratings if present
+            ann_bits = []
+            if not pd.isna(row["valence_1"]):
+                ann_bits.append(
+                    f"annotator 1: valence {row['valence_1']:.1f}, arousal {row['arousal_1']:.1f}"
+                )
+            if not pd.isna(row["valence_2"]):
+                ann_bits.append(
+                    f"annotator 2: valence {row['valence_2']:.1f}, arousal {row['arousal_2']:.1f}"
+                )
+            if ann_bits:
+                st.caption(" · ".join(ann_bits))
+
             snippet = make_snippet(row["text"], query)
             st.markdown(snippet)
 
-            if row["token_labels"]:
-                st.caption(f"Token labels: {row['token_labels']}")
-
             st.markdown("---")
+
 
