@@ -7,7 +7,7 @@ import pandas as pd
 # CONFIG
 # -------------------------------------------------------------------
 
-DATA_PATH = "data/сводный_словарь.xlsx"
+DATA_PATH = "data/сводный_словарь.csv"
 
 st.set_page_config(
     page_title="rEmoRSe Lexicon Explorer",
@@ -21,7 +21,7 @@ st.set_page_config(
 
 @st.cache_data(show_spinner=True)
 def load_lexicon(path_or_url: str) -> pd.DataFrame:
-    df = pd.read_excel(path_or_url)
+    df = pd.read_csv(path_or_url)
 
     # Normalize column names (just in case)
     df.columns = [c.strip() for c in df.columns]
